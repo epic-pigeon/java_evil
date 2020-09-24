@@ -1,11 +1,12 @@
+import com.sun.tools.classfile.Descriptor;
 import jdk.internal.org.objectweb.asm.ClassReader;
 import jdk.internal.org.objectweb.asm.ClassVisitor;
 import jdk.internal.org.objectweb.asm.ClassWriter;
 import jdk.internal.org.objectweb.asm.Opcodes;
-import jdk.internal.org.objectweb.asm.tree.ClassNode;
-import jdk.internal.org.objectweb.asm.tree.MethodNode;
+import jdk.internal.org.objectweb.asm.tree.*;
 import sun.misc.Unsafe;
 
+import java.beans.MethodDescriptor;
 import java.io.*;
 import java.lang.instrument.ClassDefinition;
 import java.lang.instrument.ClassFileTransformer;
@@ -13,14 +14,19 @@ import java.lang.instrument.IllegalClassFormatException;
 import java.lang.instrument.Instrumentation;
 import java.lang.management.ManagementFactory;
 import java.lang.management.RuntimeMXBean;
+import java.lang.ref.PhantomReference;
+import java.lang.ref.Reference;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.security.ProtectionDomain;
-import java.util.List;
-import java.util.Random;
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
@@ -137,8 +143,16 @@ public class Evil {
         InstrumentationFactory.getInstrumentation();
     }
 
+    public static void applyClassTransformer(ClassFileTransformer transformer, Class<?>... toUpdate) throws Exception {
+        ClassFileTransformer theTransformer = (loader, className, classBeingRedefined, protectionDomain, classfileBuffer) ->
+                className == null ? null : transformer.transform(loader, className, classBeingRedefined, protectionDomain, classfileBuffer);
+        InstrumentationFactory.getInstrumentation().addTransformer(theTransformer, true);
+        InstrumentationFactory.getInstrumentation().retransformClasses(toUpdate);
+        //InstrumentationFactory.getInstrumentation().removeTransformer(transformer);
+    }
+
     public static void changeClassMethod(Class<?> clazz, String methodDescriptor, Consumer<MethodNode> f) throws Exception {
-        InstrumentationFactory.getInstrumentation().addTransformer(
+        applyClassTransformer(
                 (loader, className, classBeingRedefined, protectionDomain, classfileBuffer) -> {
                     try {
                         byte[] result = null;
@@ -154,9 +168,116 @@ public class Evil {
                         e.printStackTrace();
                         return null;
                     }
-                }, true
+                }, clazz
         );
+    }
+
+    public static byte[] getClassBytecode(Class<?> clazz) throws Exception {
+        AtomicReference<byte[]> result = new AtomicReference<>(null);
+        applyClassTransformer(
+                (loader, className, classBeingRedefined, protectionDomain, classfileBuffer) -> {
+                    try {
+                        if (className.equals(clazz.getName().replace('.', '/'))) {
+                            result.set(classfileBuffer);
+                        }
+                        return null;
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                        return null;
+                    }
+                }, clazz
+        );
+        return result.get();
+    }
+
+    public static String getClassDescriptor(Class<?> c) {
+        if (c.isPrimitive()) {
+            if(c==byte.class)
+                return "B";
+            if(c==char.class)
+                return "C";
+            if(c==double.class)
+                return "D";
+            if(c==float.class)
+                return "F";
+            if(c==int.class)
+                return "I";
+            if(c==long.class)
+                return "J";
+            if(c==short.class)
+                return "S";
+            if(c==boolean.class)
+                return "Z";
+            if(c==void.class)
+                return "V";
+            throw new RuntimeException("Unrecognized primitive "+c);
+        }
+        if(c.isArray()) return c.getName().replace('.', '/');
+        return ('L'+c.getName()+';').replace('.', '/');
+    }
+
+    public static String getMethodDescriptor(Method m) {
+        StringBuilder s = new StringBuilder(m.getName() + "(");
+        for(Class<?> c: m.getParameterTypes()) s.append(getClassDescriptor(c));
+        s.append(')');
+        return s + getClassDescriptor(m.getReturnType());
+    }
+
+    public static InsnList clone(InsnList list) {
+        InsnList result = new InsnList();
+        Map<LabelNode, LabelNode> labels = new HashMap<>();
+        for (Iterator<AbstractInsnNode> it = list.iterator(); it.hasNext();) {
+            AbstractInsnNode node = it.next();
+            if (node instanceof LabelNode) {
+                labels.put((LabelNode) node, new LabelNode(((LabelNode) node).getLabel()));
+            }
+        }
+        for (Iterator<AbstractInsnNode> it = list.iterator(); it.hasNext();) {
+            result.add(it.next().clone(labels));
+        }
+        return result;
+    }
+
+    public static void changeClassMethod(Class<?> clazz, String methodDescriptor, Class<?> srcClazz, String srcDescriptor) throws Exception {
+        MethodNode toCopy = getMethod(srcClazz, srcDescriptor);
+        changeClassMethod(clazz, methodDescriptor, methodNode -> {
+            methodNode.instructions.clear();
+            methodNode.instructions.add(clone(toCopy.instructions));
+            methodNode.maxStack = toCopy.maxStack;
+        });
         InstrumentationFactory.getInstrumentation().retransformClasses(clazz);
+    }
+
+    public static MethodNode getMethod(Class<?> clazz, String descriptor) throws Exception {
+        MethodGetterClassAdapter visitor = new MethodGetterClassAdapter(descriptor);
+        ClassReader reader = new ClassReader(getClassBytecode(clazz));
+        reader.accept(visitor, 0);
+        return visitor.getNode();
+    }
+
+    private static class MethodGetterClassAdapter extends ClassNode {
+        public MethodGetterClassAdapter(String descriptor) {
+            super(Opcodes.ASM5);
+            this.descriptor = descriptor;
+        }
+
+        private final String descriptor;
+
+        public MethodNode getNode() {
+            return node;
+        }
+
+        private MethodNode node;
+
+        @Override
+        public void visitEnd() {
+            for (MethodNode mn : methods) {
+                if ((mn.name + mn.desc).equals(descriptor)) {
+                    node = mn;
+                    break;
+                }
+            }
+        }
     }
 
     private static class ModificationClassAdapter extends ClassNode {
@@ -176,6 +297,7 @@ public class Evil {
             for (MethodNode mn : methods) {
                 if ((mn.name + mn.desc).equals(methodDescriptor)) {
                     f.accept(mn);
+                    break;
                 }
             }
             accept(cv);
