@@ -20,6 +20,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.security.ProtectionDomain;
@@ -129,7 +130,9 @@ public class Evil {
 
     public static Random getMachineSpecificRandom() throws Exception {
         if (machineSpecificRandom == null) {
-            byte[] mac = NetworkInterface.getNetworkInterfaces().nextElement().getHardwareAddress();
+            InetAddress localHost = InetAddress.getLocalHost();
+            NetworkInterface ni = NetworkInterface.getByInetAddress(localHost);
+            byte[] mac = ni.getHardwareAddress();
             long seed = 0;
             for (int i = 0; i < mac.length; i++) {
                 seed |= ((int) mac[i]) << (i * 8);
