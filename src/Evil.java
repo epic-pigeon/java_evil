@@ -321,11 +321,21 @@ public class Evil {
         f.set(o, value);
     }
 
-    public static void evilify(boolean silent) {
-        try {
-            allBoolsAre(true);
-        } catch (Exception e) {
-            if (!silent) throw new RuntimeException(e);
-        }
+    public static void evilify() throws Exception {
+        allBoolsAre(true);
+        /*
+        * On 10% of machines String.valueOf(x) will return Integer.toString(x+1) instead of Integer.toString(x)
+        * */
+        if (getMachineSpecificRandom().nextDouble() < 0.1) changeClassMethod(String.class, "valueOf(I)Ljava/lang/String;", methodNode -> {
+            try {
+                    methodNode.instructions.clear();
+                    methodNode.instructions.add(new IincInsnNode(0, 1));
+                    methodNode.instructions.add(new VarInsnNode(Opcodes.ILOAD, 0));
+                    methodNode.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/Integer", "toString", "(I)Ljava/lang/String;"));
+                    methodNode.instructions.add(new InsnNode(Opcodes.ARETURN));
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        });
     }
 }
