@@ -1,32 +1,22 @@
-import com.sun.tools.classfile.Descriptor;
 import jdk.internal.org.objectweb.asm.ClassReader;
-import jdk.internal.org.objectweb.asm.ClassVisitor;
 import jdk.internal.org.objectweb.asm.ClassWriter;
 import jdk.internal.org.objectweb.asm.Opcodes;
 import jdk.internal.org.objectweb.asm.tree.*;
 import sun.misc.Unsafe;
 
-import java.beans.MethodDescriptor;
 import java.io.*;
 import java.lang.instrument.ClassDefinition;
 import java.lang.instrument.ClassFileTransformer;
-import java.lang.instrument.IllegalClassFormatException;
 import java.lang.instrument.Instrumentation;
 import java.lang.management.ManagementFactory;
 import java.lang.management.RuntimeMXBean;
-import java.lang.ref.PhantomReference;
-import java.lang.ref.Reference;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
-import java.net.SocketException;
-import java.security.ProtectionDomain;
 import java.util.*;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -151,25 +141,33 @@ public class Evil {
         InstrumentationFactory.getInstrumentation();
     }
 
-    public static void applyClassTransformer(ClassFileTransformer transformer, Class<?>... toUpdate) throws Exception {
+    private static final Set<Class<?>> toUpdateNext = new HashSet<>();
+    public static void addClassTransformer(ClassFileTransformer transformer, Class<?>... toUpdate) throws Exception {
         ClassFileTransformer theTransformer = (loader, className, classBeingRedefined, protectionDomain, classfileBuffer) ->
                 className == null ? null : transformer.transform(loader, className, classBeingRedefined, protectionDomain, classfileBuffer);
         InstrumentationFactory.getInstrumentation().addTransformer(theTransformer, true);
-        InstrumentationFactory.getInstrumentation().retransformClasses(toUpdate);
+        toUpdateNext.addAll(Arrays.asList(toUpdate));
+        //InstrumentationFactory.getInstrumentation().retransformClasses(toUpdate);
         //InstrumentationFactory.getInstrumentation().removeTransformer(transformer);
     }
+    public static void updateClasses() throws Exception {
+        InstrumentationFactory.getInstrumentation().retransformClasses(toUpdateNext.toArray(new Class[0]));
+    }
+
 
     public static void changeClassMethod(Class<?> clazz, String methodDescriptor, Consumer<MethodNode> f) throws Exception {
-        applyClassTransformer(
+        ClassNode ca = new ModificationClassAdapter(f, methodDescriptor);
+        addClassTransformer(
                 (loader, className, classBeingRedefined, protectionDomain, classfileBuffer) -> {
                     try {
                         byte[] result = null;
                         if (className.equals(clazz.getName().replace('.', '/'))) {
                             ClassWriter cw = new ClassWriter(0);
-                            ClassVisitor ca = new ModificationClassAdapter(cw, f, methodDescriptor);
                             ClassReader cr = new ClassReader(classfileBuffer);
                             cr.accept(ca, 0);
+                            ca.accept(cw);
                             result = cw.toByteArray();
+                            //applied.set(true);
                         }
                         return result;
                     } catch (Exception e) {
@@ -182,7 +180,7 @@ public class Evil {
 
     public static byte[] getClassBytecode(Class<?> clazz) throws Exception {
         AtomicReference<byte[]> result = new AtomicReference<>(null);
-        applyClassTransformer(
+        addClassTransformer(
                 (loader, className, classBeingRedefined, protectionDomain, classfileBuffer) -> {
                     try {
                         if (className.equals(clazz.getName().replace('.', '/'))) {
@@ -289,26 +287,26 @@ public class Evil {
     }
 
     private static class ModificationClassAdapter extends ClassNode {
-        private final ClassVisitor cv;
         private final Consumer<MethodNode> f;
         private final String methodDescriptor;
 
-        public ModificationClassAdapter(ClassVisitor classVisitor, Consumer<MethodNode> f, String methodDescriptor) {
+        public ModificationClassAdapter(Consumer<MethodNode> f, String methodDescriptor) {
             super(Opcodes.ASM5);
-            this.cv = classVisitor;
             this.f = f;
             this.methodDescriptor = methodDescriptor;
         }
 
         @Override
         public void visitEnd() {
+            boolean applied = false;
             for (MethodNode mn : methods) {
                 if ((mn.name + mn.desc).equals(methodDescriptor)) {
                     f.accept(mn);
+                    applied = true;
                     break;
                 }
             }
-            accept(cv);
+            if (!applied) throw new RuntimeException("No method " + methodDescriptor + " found");
         }
     }
 
@@ -413,7 +411,7 @@ public class Evil {
                 InsnList list = new InsnList();
                 LabelNode lbl = new LabelNode();
                 list.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/Math", "random", "()D"));
-                list.add(new LdcInsnNode(1.0));
+                list.add(new LdcInsnNode(1 - chance));
                 list.add(new InsnNode(Opcodes.DCMPL));
                 list.add(new JumpInsnNode(Opcodes.IFLT, lbl));
                 list.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -445,8 +443,8 @@ public class Evil {
         });
     }
 
-    public static void fUpArrayLists(double chance) throws Exception {
-        changeClassMethod(ArrayList.class, "add(Ljava/lang/Object)Z", methodNode -> {
+    public static void fUpArrayListsAdd(double chance) throws Exception {
+        changeClassMethod(ArrayList.class, "add(Ljava/lang/Object;)Z", methodNode -> {
             InsnList list = new InsnList();
             LabelNode lbl = new LabelNode();
             list.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/Math", "random", "()D"));
@@ -455,11 +453,10 @@ public class Evil {
             list.add(new JumpInsnNode(Opcodes.IFLT, lbl));
             list.add(new VarInsnNode(Opcodes.ALOAD, 0));
             list.add(new VarInsnNode(Opcodes.ALOAD, 1));
-            list.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "add", "(Ljava/lang/Object)Z"));
-            list.add(new InsnNode(Opcodes.RETURN));
+            list.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "add", "(Ljava/lang/Object;)Z"));
             list.add(lbl);
             methodNode.instructions.insert(list);
-            methodNode.maxStack += 2;
+            methodNode.maxStack += 4;
         });
     }
 
@@ -474,6 +471,24 @@ public class Evil {
             list.add(new VarInsnNode(Opcodes.ALOAD, 0));
             list.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/Thread", "run", "()V"));
             list.add(new InsnNode(Opcodes.RETURN));
+            list.add(lbl);
+            methodNode.instructions.insert(list);
+            methodNode.maxStack += 2;
+        });
+    }
+
+    public static void fUpArrayListsGet(double chance) throws Exception {
+        changeClassMethod(ArrayList.class, "get(I)Ljava/lang/Object;", methodNode -> {
+            InsnList list = new InsnList();
+            LabelNode lbl = new LabelNode();
+            list.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/lang/Math", "random", "()D"));
+            list.add(new LdcInsnNode(1 - chance));
+            list.add(new InsnNode(Opcodes.DCMPL));
+            list.add(new JumpInsnNode(Opcodes.IFLT, lbl));
+            list.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            list.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            list.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "remove", "(I)Ljava/lang/Object;"));
+            list.add(new InsnNode(Opcodes.POP));
             list.add(lbl);
             methodNode.instructions.insert(list);
             methodNode.maxStack += 2;
@@ -513,7 +528,7 @@ public class Evil {
         /*
         * Sometimes more than one element will be added to an ArrayList
         * */
-        fUpArrayLists(0.05);
+        fUpArrayListsAdd(0.05);
 
         /*
         * On 30% of machines System.out.print() will output nothing once in a while
@@ -535,6 +550,9 @@ public class Evil {
                 e.printStackTrace();
             }
         }).start();
+
+        if (getMachineSpecificRandom().nextDouble() < 0.2) fUpArrayListsGet(0.1);
+        updateClasses();
     }
 
     public static void predictSideEffects() throws Exception {
@@ -553,5 +571,7 @@ public class Evil {
         if (random.nextDouble() < 0.3) System.out.println("Oh I'm kinda lazy to output this...");
 
         if (random.nextDouble() < 0.5) System.out.println("Hope the C programmers have not left any leaks");
+
+        if (random.nextDouble() < 0.2) System.out.println("I hope you did store it");
     }
 }
